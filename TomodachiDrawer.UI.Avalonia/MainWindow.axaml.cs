@@ -1,7 +1,8 @@
+using System.Reflection;
+using System.Text.Json;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
-using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -9,20 +10,12 @@ using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using Avalonia.Styling;
 using Avalonia.Threading;
-
 using SkiaSharp;
-
-using System.Reflection;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-
 using TomodachiDrawer.Core;
-using TomodachiDrawer.Core.ImageProcessing;
 using TomodachiDrawer.Core.ImageProcessing.Denoising;
 using TomodachiDrawer.Core.ImageProcessing.Quantizers;
 using TomodachiDrawer.Core.Models;
 using TomodachiDrawer.Core.OutputSinks;
-
 using Button = Avalonia.Controls.Button; // conflict with the Button enum in SinkEnums
 
 namespace TomodachiDrawer.UI.Avalonia;
@@ -32,12 +25,18 @@ public partial class MainWindow : Window
     private const string SettingsFilePath = "settings.json";
 
     private string _currentImagePath = string.Empty;
+    private bool _isBoardConnected = false;
     private readonly CancellationTokenSource _cts = new();
 
-
     private bool BusyExporting = false;
-    private SwitchVersion _selectedSwitchVersion = SwitchVersion.None;
-    private int _selectedThemeIndex = 0; // 0 is System.
+
+    //private SwitchVersion _selectedSwitchVersion = SwitchVersion.None;
+    //private int _selectedThemeIndex = 0; // 0 is System.
+    private AppSettings _currentSettings = new(); // All cases will result in it being non-null but IntelliSense cant see that far.
+
+    private UF2Flasher.BoardType _selectedBoardType => BoardTypeComboBox != null
+        ? (UF2Flasher.BoardType)(BoardTypeComboBox.SelectedIndex)
+        : UF2Flasher.BoardType.Unknown;
 
     public MainWindow()
     {
@@ -56,11 +55,7 @@ public partial class MainWindow : Window
         DenoisingComboBox.SelectionChanged += (_, _) => UpdatePreview();
 
         GetSettings();
-        SwitchVersionComboBox.SelectedIndex = (int)_selectedSwitchVersion - 1;
-        SetTheme(_selectedThemeIndex);
-        AppThemeComboBox.SelectedIndex = _selectedThemeIndex;
 
-        // this dont work
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DropEvent, OnDrop);
         AddHandler(DragDrop.DragOverEvent, OnDragOver);
@@ -68,21 +63,29 @@ public partial class MainWindow : Window
 #if DEBUG
         this.Title = $"TomodachiDrawer.UI.Avalonia - {GetVersionString(true)}";
 #else
-        this.Title = $"TomodachiDrawer.UI.Avalonia - {GetVersionString(false)}";
+        this.Title = $"TomodachiDrawer - {GetVersionString(false)}";
 #endif
 
-        StartRP2040Polling();
-        _ = PerformAsyncUpdateCheck();
+        StartBoardPolling();
+        if (CheckForUpdatesCheckBox.IsChecked)
+            _ = PerformAsyncUpdateCheck();
+
+        UpdateFirmwareButtons();
     }
 
     private static string GetVersionString(bool includeCommit)
     {
-        var currentVersion = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "dev";
-        if (currentVersion.StartsWith("1.0.0"))
+        var currentVersion =
+            Assembly
+                .GetEntryAssembly()
+                ?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+                ?.InformationalVersion
+            ?? "dev";
+        if (currentVersion.StartsWith("0.0.0"))
         {
             if (includeCommit)
             {
-                return "dev-" + currentVersion.Split('+').Last();
+                return "dev+" + currentVersion.Split('+').Last();
             }
             else
             {
@@ -109,14 +112,17 @@ public partial class MainWindow : Window
             using var http = new HttpClient();
             http.DefaultRequestHeaders.UserAgent.ParseAdd($"TomodachiDrawer {ourVersion}");
 
-            using var response = await http.GetAsync("https://api.github.com/repos/Lucas7yoshi/TomodachiDrawer/releases/latest");
+            using var response = await http.GetAsync(
+                "https://api.github.com/repos/Lucas7yoshi/TomodachiDrawer/releases/latest"
+            );
             response.EnsureSuccessStatusCode();
             using var responseStream = await response.Content.ReadAsStreamAsync();
 
             using var responseJsonObject = JsonDocument.Parse(responseStream);
 
             // 0.0.0 format, no v, no -.
-            var releaseVersionTag = responseJsonObject.RootElement.GetProperty("tag_name").GetString() ?? "0.0.0";
+            var releaseVersionTag =
+                responseJsonObject.RootElement.GetProperty("tag_name").GetString() ?? "0.0.0";
 
             // see if its newer. TODO: Actually check that, only really effects using the artifacts from the release build before
             // i've published the release though.
@@ -126,11 +132,12 @@ public partial class MainWindow : Window
                 {
                     _ = ShowMessageAsync(
                         "Update available",
-                        "A new update is available on GitHub." +
-                        $"\nCurrent Version: {ourVersion}" +
-                        $"\nLatest Version: {releaseVersionTag}" +
-                        $"\n\nDownload at:\nhttps://github.com/Lucas7yoshi/TomodachiDrawer",
-                        new Uri("https://github.com/Lucas7yoshi/TomodachiDrawer/releases"), "Open Releases"
+                        "A new update is available on GitHub."
+                            + $"\nCurrent Version: {ourVersion}"
+                            + $"\nLatest Version: {releaseVersionTag}"
+                            + $"\n\nDownload at:\nhttps://github.com/Lucas7yoshi/TomodachiDrawer",
+                        new Uri("https://github.com/Lucas7yoshi/TomodachiDrawer/releases"),
+                        "Open Releases"
                     );
                 }
                 else
@@ -143,9 +150,7 @@ public partial class MainWindow : Window
         {
             AppendLog($"Failed to check for updates: {ex.Message}");
         }
-
     }
-
 
     protected override void OnClosed(System.EventArgs e)
     {
@@ -153,51 +158,60 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
-    // ── RP2040 polling ────────────────────────────────────────────────
+    // ── Board polling ────────────────────────────────────────────────
 
-    private void StartRP2040Polling()
+    private void StartBoardPolling()
     {
         _ = Task.Run(async () =>
         {
             bool lastState = false;
             while (!_cts.Token.IsCancellationRequested)
             {
-                var path = UF2Flasher.FindRP2040Drive();
+                var path = UF2Flasher.FindBoardDrive();
+                var detectedBoardType = path != null ? UF2Flasher.DetectBoardType(path) : UF2Flasher.BoardType.Unknown;
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     bool hasImage = !string.IsNullOrEmpty(_currentImagePath);
-
-                    // ExportUF2 only needs an image — no RP2040 required
-                    ExportUF2Button.IsEnabled = hasImage;
+                    bool isBoardSupported = detectedBoardType != UF2Flasher.BoardType.Unknown;
 
                     if (path != null)
                     {
-                        RP2040StatusLabel.Text = $"RP2040 found: {path}";
-                        RP2040StatusLabel.Foreground = Brushes.Green;
+                        string boardName = detectedBoardType switch
+                        {
+                            UF2Flasher.BoardType.RP2040 => "RP2040",
+                            UF2Flasher.BoardType.RP2350 => "RP2350",
+                            _ => "Unknown Board",
+                        };
+                        BoardStatusLabel.Text = $"{boardName} found: {path}";
+                        BoardStatusLabel.Foreground = Brushes.Green;
 
-                        FlashFirmwareButton.IsEnabled = !BusyExporting;
-                        ExportRP2040Button.IsEnabled = hasImage && !BusyExporting;
-                        ExportUF2Button.IsEnabled = hasImage && !BusyExporting;
+                        _isBoardConnected = true;
+
                         if (!lastState)
                         {
-                            AppendLog($"RP2040 connected @ {path}");
+                            BoardTypeComboBox.SelectedIndex = (int)(detectedBoardType);
+
+                            AppendLog($"{boardName} connected @ {path}");
                             lastState = true;
                         }
                     }
                     else
                     {
-                        RP2040StatusLabel.Text = "RP2040 not found";
-                        RP2040StatusLabel.Foreground = Brushes.Red;
+                        BoardStatusLabel.Text = "Board not found";
+                        BoardStatusLabel.Foreground = Brushes.Red;
 
-                        FlashFirmwareButton.IsEnabled = false;
-                        ExportRP2040Button.IsEnabled = false;
-                        ExportUF2Button.IsEnabled = hasImage && !BusyExporting;
+                        _isBoardConnected = false;
+
                         if (lastState)
                         {
-                            AppendLog("RP2040 disconnected...");
+                            BoardTypeComboBox.SelectedIndex = (int)(UF2Flasher.BoardType.Unknown);
+
+                            AppendLog("Board disconnected...");
                             lastState = false;
                         }
                     }
+
+                    UpdateFirmwareButtons();
                 });
 
                 try
@@ -211,6 +225,7 @@ public partial class MainWindow : Window
             }
         });
     }
+
     #region Image/Preview
     private void LoadImage(string path)
     {
@@ -254,12 +269,25 @@ public partial class MainWindow : Window
 
         _currentImagePath = path;
         ImagePathBox.Text = path;
-        ExportUF2Button.IsEnabled = true;
+        UpdateFirmwareButtons();
         UpdatePreview();
         TSPTimeLimitUpDown.Value = (decimal)
             CanvasDrawer.GetRecommendedTSPSolveTime(img.Width, img.Height);
         AppendLog($"Loaded image: {Path.GetFileName(path)} ({img.Width}x{img.Height})");
         img.Dispose();
+    }
+
+    private SKBitmap GetPreview()
+    {
+        var pal = new ColourPalette(new DummySink());
+        var denoiser = DenoisingComboBox.SelectedItem?.ToString();
+        var quantizerSettings = GetQuantizerSettings();
+        var preview = pal.PreviewColourMapping(
+            SKBitmap.Decode(_currentImagePath),
+            quantizerSettings,
+            denoiser
+        );
+        return preview;
     }
 
     private void UpdatePreview()
@@ -270,14 +298,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        var pal = new ColourPalette(new DummySink());
-        var denoiser = DenoisingComboBox.SelectedItem?.ToString();
         var quantizerSettings = GetQuantizerSettings();
-        var preview = pal.PreviewColourMapping(
-            SKBitmap.Decode(_currentImagePath),
-            quantizerSettings,
-            denoiser
-        );
+        var preview = GetPreview();
+
         PreviewImage.Source = ToAvaloniaBitmap(preview);
         AppendLog(
             $"Updated preview for {Path.GetFileName(_currentImagePath)} using {quantizerSettings.quantizerName}"
@@ -302,8 +325,23 @@ public partial class MainWindow : Window
         });
     }
 
+    private void UpdateFirmwareButtons()
+    {
+        bool hasImage = !string.IsNullOrEmpty(_currentImagePath);
+        bool isBoardSupported = _selectedBoardType != UF2Flasher.BoardType.Unknown;
+
+        FlashFirmwareButton?.IsEnabled = _isBoardConnected && isBoardSupported && !BusyExporting;
+        ExportToBoardButton?.IsEnabled = _isBoardConnected && isBoardSupported && hasImage && !BusyExporting;
+        ExportUF2Button?.IsEnabled = isBoardSupported && hasImage && !BusyExporting;
+    }
+
     // messagebox replacement
-    private async Task ShowMessageAsync(string title, string message, Uri? link = null, string? linkButtonText = null)
+    private async Task ShowMessageAsync(
+        string title,
+        string message,
+        Uri? link = null,
+        string? linkButtonText = null
+    )
     {
         var buttonRow = new StackPanel
         {
@@ -319,10 +357,7 @@ public partial class MainWindow : Window
             MinWidth = 80,
         };
 
-        var stack = new StackPanel()
-        {
-            Margin = new Thickness(16)
-        };
+        var stack = new StackPanel() { Margin = new Thickness(16) };
         buttonRow.Children.Add(okButton);
 
         Button? linkButton = null;
@@ -338,12 +373,15 @@ public partial class MainWindow : Window
             buttonRow.Children.Add(linkButton);
         }
 
-        stack.Children.Insert(0, new SelectableTextBlock
-        {
-            Text = message,
-            TextWrapping = TextWrapping.Wrap,
-            MaxWidth = 400,
-        });
+        stack.Children.Insert(
+            0,
+            new SelectableTextBlock
+            {
+                Text = message,
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 400,
+            }
+        );
         stack.Children.Add(buttonRow);
 
         var dialog = new Window
@@ -353,7 +391,7 @@ public partial class MainWindow : Window
             CanResize = false,
             Width = 440,
             SizeToContent = SizeToContent.Height,
-            Content = stack
+            Content = stack,
         };
 
         okButton.Click += (_, _) => dialog.Close();
@@ -420,18 +458,18 @@ public partial class MainWindow : Window
         return new QuantizerSettings(quantizerName, default, default);
     }
 
-    private async void ExportRP2040Button_Click(object? sender, RoutedEventArgs e)
+    private async void ExportToBoardButton_Click(object? sender, RoutedEventArgs e)
     {
         if (string.IsNullOrEmpty(_currentImagePath))
             return;
 
-        if (_selectedSwitchVersion == SwitchVersion.None)
+        if (_currentSettings.SelectedSwitchVersion == SwitchVersion.None)
         {
             _ = ShowMessageAsync(
                 "Select Switch Version",
-                "For compatibility, you must select a switch version in the dropdown." +
-                "\n\nSwitch 1 is more prone to desyncs, so this avoids certain things that are particularly prone to desyncing." +
-                "\nPlease be aware that even with Switch 1 selected, desyncs are unfortunately expected due to inconsistent and unpredictable lag in the drawing UI."
+                "For compatibility, you must select a switch version in the dropdown."
+                    + "\n\nSwitch 1 is more prone to desyncs, so this avoids certain things that are particularly prone to desyncing."
+                    + "\nPlease be aware that even with Switch 1 selected, desyncs are unfortunately expected due to inconsistent and unpredictable lag in the drawing UI."
             );
             return;
         }
@@ -439,11 +477,14 @@ public partial class MainWindow : Window
         var imagePath = _currentImagePath;
         var denoiser = DenoisingComboBox.SelectedItem?.ToString();
         var tspLimit = (float)(TSPTimeLimitUpDown.Value ?? 0.5m);
+        var boardType = _selectedBoardType;
 
         BusyExporting = true;
-        ExportRP2040Button.IsEnabled = false;
+        UpdateFirmwareButtons();
+
         TimeSpan totalTime = TimeSpan.MaxValue;
         var settings = GetQuantizerSettings();
+        var enableExperimental = EnableExperimentalCheckBox.IsChecked ?? false;
 
         await Task.Run(async () =>
         {
@@ -454,10 +495,22 @@ public partial class MainWindow : Window
 
             AppendLog($"Exporting to RP2040 flash ({Path.GetFileName(tempPath)})");
             var timingSink = new TimingSink();
-            var drawer = new CanvasDrawer(timingSink, _selectedSwitchVersion, AppendLog);
+            var drawer = new CanvasDrawer(
+                timingSink,
+                _currentSettings.SelectedSwitchVersion,
+                AppendLog
+            );
             drawer.ConnectAndConfirmController();
             AppendLog("Starting to generate inputs...");
-            await drawer.DrawImage(SKBitmap.Decode(imagePath), settings, denoiser, tspLimit, false);
+            var drawSettings = new DrawImageSettings()
+            {
+                QuantizerSettings = settings,
+                DenoiserName = denoiser,
+                TSPTimeLimit = tspLimit,
+                DisableLargeBrush = false,
+                EnableExperimentalFeatures = enableExperimental,
+            };
+            await drawer.DrawImage(SKBitmap.Decode(imagePath), drawSettings);
             AppendLog($"True complete overall time is: {timingSink.TotalTime.TotalSeconds}s");
 
             var fileSink = new FileControllerSink(tempPath);
@@ -465,14 +518,14 @@ public partial class MainWindow : Window
             fileSink.Dispose();
 
             var tdldBytes = File.ReadAllBytes(tempPath);
-            var uf2Bytes = UF2Flasher.BuildTDLDUF2(tdldBytes);
-            var drivePath = UF2Flasher.FindRP2040Drive();
+            var uf2Bytes = UF2Flasher.BuildTDLDUF2(tdldBytes, boardType);
+            var drivePath = UF2Flasher.FindBoardDrive();
 
             if (uf2Bytes != null && uf2Bytes.Length > 0 && drivePath != null)
             {
                 File.WriteAllBytes(Path.Combine(drivePath, "tdld_image.uf2"), uf2Bytes);
                 AppendLog(
-                    "Wrote to RP2040 flash. Unplug the RP2040 and plug it into the switch without holding any button."
+                    "Wrote to board's flash. Unplug the board and plug it into your Nintendo Switch without holding any buttons."
                 );
             }
 
@@ -482,7 +535,7 @@ public partial class MainWindow : Window
         });
 
         BusyExporting = false;
-        ExportRP2040Button.IsEnabled = true;
+        UpdateFirmwareButtons();
 
         SetEstimate(totalTime);
     }
@@ -498,13 +551,13 @@ public partial class MainWindow : Window
         if (string.IsNullOrEmpty(_currentImagePath))
             return;
 
-        if (_selectedSwitchVersion == SwitchVersion.None)
+        if (_currentSettings.SelectedSwitchVersion == SwitchVersion.None)
         {
             _ = ShowMessageAsync(
                 "Select Switch Version",
-                "For compatibility, you must select a switch version in the dropdown." +
-                "\n\nSwitch 1 is more prone to desyncs, so this avoids certain things that are particularly prone to desyncing." +
-                "\nPlease be aware that even with Switch 1 selected, desyncs are unfortunately expected due to inconsistent and unpredictable lag in the drawing UI."
+                "For compatibility, you must select a switch version in the dropdown."
+                    + "\n\nSwitch 1 is more prone to desyncs, so this avoids certain things that are particularly prone to desyncing."
+                    + "\nPlease be aware that even with Switch 1 selected, desyncs are unfortunately expected due to inconsistent and unpredictable lag in the drawing UI."
             );
             return;
         }
@@ -514,7 +567,8 @@ public partial class MainWindow : Window
             {
                 Title = "Save .UF2",
                 DefaultExtension = "uf2",
-                FileTypeChoices = [
+                FileTypeChoices =
+                [
                     new FilePickerFileType("UF2 Firmware Image") { Patterns = ["*.uf2"] },
                     new FilePickerFileType("All Files") { Patterns = ["*.*"] },
                 ],
@@ -529,10 +583,12 @@ public partial class MainWindow : Window
         var denoiser = DenoisingComboBox.SelectedItem?.ToString();
         var tspLimit = (float)(TSPTimeLimitUpDown.Value ?? 0.5m);
 
-        ExportUF2Button.IsEnabled = false;
         BusyExporting = true;
+        UpdateFirmwareButtons();
+
         TimeSpan totalTime = TimeSpan.MaxValue;
         var settings = GetQuantizerSettings();
+        var enableExperimental = EnableExperimentalCheckBox.IsChecked ?? false;
 
         await Task.Run(async () =>
         {
@@ -543,10 +599,22 @@ public partial class MainWindow : Window
 
             AppendLog($"Exporting to UF2 ({Path.GetFileName(tempPath)})");
             var timingSink = new TimingSink();
-            var drawer = new CanvasDrawer(timingSink, _selectedSwitchVersion, AppendLog);
+            var drawer = new CanvasDrawer(
+                timingSink,
+                _currentSettings.SelectedSwitchVersion,
+                AppendLog
+            );
             drawer.ConnectAndConfirmController();
             AppendLog("Starting to generate inputs...");
-            await drawer.DrawImage(SKBitmap.Decode(imagePath), settings, denoiser, tspLimit, false);
+            var drawSettings = new DrawImageSettings()
+            {
+                QuantizerSettings = settings,
+                DenoiserName = denoiser,
+                TSPTimeLimit = tspLimit,
+                DisableLargeBrush = false,
+                EnableExperimentalFeatures = enableExperimental,
+            };
+            await drawer.DrawImage(SKBitmap.Decode(imagePath), drawSettings);
             AppendLog($"True complete overall time is: {timingSink.TotalTime.TotalSeconds}s");
 
             var fileSink = new FileControllerSink(tempPath);
@@ -554,7 +622,7 @@ public partial class MainWindow : Window
             fileSink.Dispose();
 
             var tdldBytes = File.ReadAllBytes(tempPath);
-            var uf2Bytes = UF2Flasher.BuildTDLDUF2(tdldBytes);
+            var uf2Bytes = UF2Flasher.BuildTDLDUF2(tdldBytes, _selectedBoardType);
 
             if (uf2Bytes != null && uf2Bytes.Length > 0)
             {
@@ -567,37 +635,47 @@ public partial class MainWindow : Window
             totalTime = timingSink.TotalTime;
         });
 
-        ExportUF2Button.IsEnabled = true;
         BusyExporting = false;
+        UpdateFirmwareButtons();
 
         SetEstimate(totalTime);
     }
 
+    private void BoardTypeComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        UpdateFirmwareButtons();
+    }
+
     private void FlashFirmwareButton_Click(object? sender, RoutedEventArgs e)
     {
-        const string firmwareFile = "TomodachiDrawer.Firmware.uf2";
-        var drivePath = UF2Flasher.FindRP2040Drive();
+        string firmwareFile = _selectedBoardType switch
+        {
+            UF2Flasher.BoardType.RP2350 => "TomodachiDrawer.Firmware.rp2350.uf2",
+            // RP2040 is the most common board, even if detection fails.
+            _ => "TomodachiDrawer.Firmware.rp2040.uf2",
+        };
+        var drivePath = UF2Flasher.FindBoardDrive();
 
         if (!File.Exists(firmwareFile))
         {
             _ = ShowMessageAsync(
                 "Error flashing base firmware",
-                "For some reason could not locate TomodachiDrawer.Firmware.uf2" +
-                "\nPlease ensure that you extracted the program to a zip folder, and ran the executable from that extracted folder." +
-                "\nIf you can still not flash with this button, you can manually drag the TomodachiDrawer.Firmware.uf2 file to the RPI-RP2 drive on your system to flash it."
+                $"For some reason could not locate {firmwareFile}"
+                + $"\nPlease ensure that you extracted the program to a zip folder, and ran the executable from that extracted folder."
+                + $"\nIf you can still not flash with this button, you can manually drag the {firmwareFile} file to the RPI-RP2 or RP2350 drive on your system to flash it."
             );
             return;
         }
         if (drivePath == null)
         {
-            _ = ShowMessageAsync("Error", "RP2040 not detected. Connect it in BOOT mode first.");
+            _ = ShowMessageAsync("Error", "No board detected. Connect it in BOOT mode first.");
             return;
         }
 
-        File.Copy(firmwareFile, Path.Combine(drivePath, firmwareFile), overwrite: true);
+        File.Copy(firmwareFile, Path.Combine(drivePath, Path.GetFileName(firmwareFile)), overwrite: true);
 
         var timeout = System.DateTime.Now.AddSeconds(10);
-        while (UF2Flasher.FindRP2040Drive() != null)
+        while (UF2Flasher.FindBoardDrive() != null)
         {
             if (System.DateTime.Now > timeout)
             {
@@ -614,7 +692,7 @@ public partial class MainWindow : Window
             "",
             "Base firmware flashed! You can now use the standard output button to output your images to it!\nIf this is your first time, its likely flashing red. Simply hold BOOT and plug it back in, or hold BOOT and press reset if you have it."
         );
-        AppendLog("Flashed base firmware to RP2040\r\n");
+        AppendLog($"Flashed base firmware to board\r\n");
     }
 
     private void OutputExplanationButton_Click(object? sender, RoutedEventArgs e)
@@ -682,6 +760,7 @@ public partial class MainWindow : Window
             return;
 
         SetTheme(AppThemeComboBox.SelectedIndex);
+        SaveSettings();
     }
 
     private void SetTheme(int index)
@@ -696,7 +775,7 @@ public partial class MainWindow : Window
         if (Application.Current is { } app)
         {
             app.RequestedThemeVariant = desiredTheme;
-            _selectedThemeIndex = index;
+            _currentSettings.SelectedThemeIndex = index;
         }
     }
 
@@ -713,16 +792,19 @@ public partial class MainWindow : Window
                 + "\nIf time is of the essence, you can also enable Denoising which can increase the number of large spots for the larger brushes."
         );
     }
-    #region Settings
+
+    private JsonSerializerOptions _jsonOptions = new JsonSerializerOptions()
+    {
+#if DEBUG
+        WriteIndented = true
+#else
+        WriteIndented = false
+#endif
+    };
+
     private void SaveSettings()
     {
-        var settings = new AppSettings
-        {
-            SelectedSwitchVersion = _selectedSwitchVersion,
-            SelectedThemeIndex = _selectedThemeIndex,
-        };
-
-        var json = JsonSerializer.Serialize(settings);
+        var json = JsonSerializer.Serialize(_currentSettings, _jsonOptions);
         File.WriteAllText(SettingsFilePath, json);
     }
 
@@ -737,8 +819,16 @@ public partial class MainWindow : Window
 
                 if (settings != null)
                 {
-                    _selectedSwitchVersion = settings.SelectedSwitchVersion;
-                    _selectedThemeIndex = settings.SelectedThemeIndex;
+                    _currentSettings = settings;
+
+                    SwitchVersionComboBox.SelectedIndex =
+                        (int)_currentSettings.SelectedSwitchVersion - 1;
+                    SetTheme(_currentSettings.SelectedThemeIndex);
+                    AppThemeComboBox.SelectedIndex = _currentSettings.SelectedThemeIndex;
+
+                    EnableExperimentalCheckBox.IsChecked =
+                        _currentSettings.EnableExperimentalFeatures;
+                    CheckForUpdatesCheckBox.IsChecked = _currentSettings.CheckForUpdatesOnStart;
                     return;
                 }
             }
@@ -748,24 +838,106 @@ public partial class MainWindow : Window
             }
         }
 
-        _selectedSwitchVersion = SwitchVersion.None;
-        _selectedThemeIndex = 0;
+        // if no images or we fail, fall to defaults in the appsettings class.
+        _currentSettings = new AppSettings();
     }
 
+    // TODO: replace _selectedSwitchVersion and _selectedThemeIndex with just a instance of
+    // appsettings with whatever was last loaded.
     private class AppSettings
     {
-        public SwitchVersion SelectedSwitchVersion { get; init; }
+        public SwitchVersion SelectedSwitchVersion { get; set; } = SwitchVersion.None;
 
-        public int SelectedThemeIndex { get; init; }
+        public int SelectedThemeIndex { get; set; } = 0;
+
+        public bool EnableExperimentalFeatures { get; set; } = false;
+
+        public bool CheckForUpdatesOnStart { get; set; } = true;
     }
 
     private void SwitchVersionComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         if (SwitchVersionComboBox.SelectedIndex == 0)
-            _selectedSwitchVersion = SwitchVersion.Switch1;
+            _currentSettings.SelectedSwitchVersion = SwitchVersion.Switch1;
         else
-            _selectedSwitchVersion = SwitchVersion.Switch2;
+            _currentSettings.SelectedSwitchVersion = SwitchVersion.Switch2;
         SaveSettings();
     }
-    #endregion
+
+    private void EnableExperimentalCheckBox_IsCheckedChanged(object? sender, RoutedEventArgs e)
+    {
+        if (EnableExperimentalCheckBox.IsChecked == true)
+        {
+            _ = ShowMessageAsync(
+                "Experimental Features",
+                "WARNING: Enabling experimental features may induce more common desyncs. Things that are prone to desyncs, but that are desired to be made stable are put here."
+                    + "\nNamely, this includes bucket filling dynamic areas on the switch 2."
+                    + "\nOnly enable this if you are okay with the increased chance of desyncs. Having this disabled does not guarantee it will work, but that is the goal and in 99% of cases it will work.",
+                new Uri("https://github.com/Lucas7yoshi/TomodachiDrawer/issues/34"),
+                "Open Experimental Feature Info"
+            );
+        }
+        _currentSettings.EnableExperimentalFeatures = EnableExperimentalCheckBox.IsChecked ?? true;
+        SaveSettings();
+    }
+
+    private void CheckForUpdatesCheckBox_Click(object? sender, RoutedEventArgs e)
+    {
+        _currentSettings.CheckForUpdatesOnStart = CheckForUpdatesCheckBox.IsChecked;
+        SaveSettings();
+    }
+
+    private async void MenuSavePreview_Click(object? sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrEmpty(_currentImagePath))
+            return;
+        // very scientific
+        var img = GetPreview();
+        // save it to disk... wherever desired.
+        var file = await StorageProvider.SaveFilePickerAsync(
+            new FilePickerSaveOptions
+            {
+                Title = "Save preview .png",
+                DefaultExtension = "png",
+                FileTypeChoices =
+                [
+                    new FilePickerFileType("Portable Network Graphics Image")
+                    {
+                        Patterns = ["*.png"],
+                    },
+                    new FilePickerFileType("All Files") { Patterns = ["*.*"] },
+                ],
+            }
+        );
+
+        var outputPath = file?.TryGetLocalPath();
+        if (outputPath == null)
+            return;
+
+        using var data = SKImage.FromBitmap(img).Encode(SKEncodedImageFormat.Png, 100);
+        File.WriteAllBytes(outputPath, data.ToArray());
+
+        AppendLog($"Saved current preview to {outputPath}");
+    }
+
+    private void MenuHelpOpenGitHub_Click(object? sender, RoutedEventArgs e) =>
+        Launcher.LaunchUriAsync(new Uri("https://github.com/Lucas7yoshi/TomodachiDrawer"));
+
+    private void MenuHelpAbout_Click(object? sender, RoutedEventArgs e)
+    {
+        var message = $"TomodachiDrawer {GetVersionString(false)}";
+        var commit = GetVersionString(true).Split("+").Last();
+        message += $"\nBuilt from commit: {commit}";
+
+        message +=
+            $"\n\nCreated by Lucas7yoshi and contributors.\nThis project is Free and Open Source Software licensed under the GPLv3.0 License."
+            + $"\nSource code is available on GitHub"
+            + $"\n\nThis program is in no way affiliated, endorsed, sponsored or created by Nintendo.";
+        _ = ShowMessageAsync("About TomodachiDrawer", message);
+    }
+
+    private void MenuExit_Click(object? sender, RoutedEventArgs e)
+    {
+        Close();
+    }
 }
